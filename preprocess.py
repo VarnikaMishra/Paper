@@ -2,774 +2,235 @@ import os
 import joblib
 import numpy as np
 import pandas as pd
-
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
+from code2vec_extractor import extractor
+
 
 # ============================================================
-# PATHS
+# PATHS & CONSTANTS
 # ============================================================
 
 DATA_DIR = "data"
 MODEL_DIR = "models"
 
-CM1_PATH = os.path.join(
-    DATA_DIR,
-    "cm1.csv"
-)
-
-SCALER_PATH = os.path.join(
-    MODEL_DIR,
-    "scaler.pkl"
-)
-
-FEATURES_PATH = os.path.join(
-    MODEL_DIR,
-    "features.pkl"
-)
-
-# Files for inspecting preprocessing
-CLEANED_DATA_PATH = os.path.join(
-    DATA_DIR,
-    "cm1_cleaned.csv"
-)
-
-TRAIN_SCALED_PATH = os.path.join(
-    DATA_DIR,
-    "cm1_train_scaled.csv"
-)
-
-TEST_SCALED_PATH = os.path.join(
-    DATA_DIR,
-    "cm1_test_scaled.csv"
-)
+CM1_PATH = os.path.join(DATA_DIR, "cm1.csv")
+SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
+FEATURES_PATH = os.path.join(MODEL_DIR, "features.pkl")
+CLEANED_DATA_PATH = os.path.join(DATA_DIR, "cm1_cleaned.csv")
+TRAIN_SCALED_PATH = os.path.join(DATA_DIR, "cm1_train_scaled.csv")
+TEST_SCALED_PATH = os.path.join(DATA_DIR, "cm1_test_scaled.csv")
 
 
 # ============================================================
-# DATASET LOADING
+# DATASET LOADING & CLEANING (SECTION 4.2.1)
 # ============================================================
 
-def load_dataset():
+def load_dataset(dataset_path=None):
     """
-    Load the CM1 dataset.
-
-    Paper 1 uses only cm1.csv.
+    Loads software defect dataset (e.g. CM1 from PROMISE repository).
+    Section 4.1 Data Collection.
     """
+    target_path = dataset_path or CM1_PATH
+    if not os.path.exists(target_path):
+        # Fallback to root if data directory not populated
+        if os.path.exists("cm1.csv"):
+            target_path = "cm1.csv"
+        else:
+            raise FileNotFoundError(
+                f"Dataset not found at: {target_path}. Please place cm1.csv in data/ or root directory."
+            )
 
-    if not os.path.exists(CM1_PATH):
-
-        raise FileNotFoundError(
-            f"CM1 dataset not found: {CM1_PATH}\n"
-            "Make sure cm1.csv is inside the data folder."
-        )
-
-    data = pd.read_csv(
-        CM1_PATH
-    )
-
-    print(
-        f"CM1 shape: {data.shape}"
-    )
-
+    data = pd.read_csv(target_path)
+    print(f"Loaded dataset from {target_path} with shape: {data.shape}")
     return data
 
 
-# ============================================================
-# TARGET PROCESSING
-# ============================================================
-
 def process_target(data):
     """
-    Convert the defects column into binary labels.
-
-    Output:
-        0 = Non-defective
-        1 = Defective
+    Converts target defect labels into binary format (0 = Non-defective, 1 = Defective).
+    Handles boolean, string, and integer representations.
     """
+    target_col = None
+    for col in ["defects", "Defective", "bug", "fault", "class"]:
+        if col in data.columns:
+            target_col = col
+            break
 
-    if "defects" not in data.columns:
+    if target_col is None:
+        raise ValueError("Could not find a defect target column (e.g. 'defects') in dataset.")
 
-        raise ValueError(
-            "The dataset does not contain "
-            "a 'defects' column."
-        )
+    target = data[target_col]
 
-    target = data["defects"]
-
-    # --------------------------------------------------------
-    # Handle string labels
-    # --------------------------------------------------------
-
-    if target.dtype == object:
-
-        target = (
-            target
-            .astype(str)
-            .str.strip()
-            .str.lower()
-        )
-
+    if target.dtype == object or target.dtype == bool:
+        target = target.astype(str).str.strip().str.lower()
         mapping = {
-            "true": 1,
-            "false": 0,
-            "yes": 1,
-            "no": 0,
-            "1": 1,
-            "0": 0
+            "true": 1, "false": 0, "yes": 1, "no": 0,
+            "1": 1, "0": 0, "buggy": 1, "clean": 0,
+            "defective": 1, "non-defective": 0
         }
-
-        target = target.map(
-            mapping
-        )
-
+        target = target.map(mapping)
     else:
+        target = pd.to_numeric(target, errors="coerce")
 
-        target = pd.to_numeric(
-            target,
-            errors="coerce"
-        )
-
-    # --------------------------------------------------------
-    # Check invalid values
-    # --------------------------------------------------------
+    # Binarize if count of defects > 0
+    target = target.apply(lambda v: 1 if v > 0 else 0)
 
     if target.isna().any():
+        target = target.fillna(0)
 
-        invalid_count = target.isna().sum()
+    return target.astype(int)
 
-        raise ValueError(
-            f"Found {invalid_count} invalid "
-            "values in the 'defects' column."
-        )
-
-    target = target.astype(
-        int
-    )
-
-    # --------------------------------------------------------
-    # Check binary labels
-    # --------------------------------------------------------
-
-    unique_values = sorted(
-        target.unique()
-    )
-
-    if not set(
-        unique_values
-    ).issubset({0, 1}):
-
-        raise ValueError(
-            f"Unexpected target values: "
-            f"{unique_values}. "
-            "Expected binary 0/1 labels."
-        )
-
-    return target
-
-
-# ============================================================
-# FEATURE IDENTIFICATION
-# ============================================================
 
 def get_feature_columns(data):
     """
-    Identify the numerical software metrics.
-
-    Excluded:
-        id
-        defects
+    Identifies software metric columns excluding ID and label columns.
+    Section 4.1: 20+ traditional static metrics (McCabe & Halstead).
     """
+    excluded = {"id", "defects", "Defective", "bug", "fault", "class", "name", "file", "version"}
+    feature_cols = [c for c in data.columns if c not in excluded and pd.api.types.is_numeric_dtype(data[c])]
+    if not feature_cols:
+        # Fallback: try converting any remaining non-excluded columns to numeric
+        feature_cols = [c for c in data.columns if c not in excluded]
+    return feature_cols
 
-    excluded_columns = {
-        "id",
-        "defects"
-    }
 
-    feature_columns = []
+def clean_features(data, feature_columns, missing_threshold=0.5):
+    """
+    Handling Missing Values (Section 4.2.1):
+    - Replaces inf/-inf with NaN
+    - Trims features with disproportionately high missing values (> missing_threshold)
+    - Imputes missing numerical values using feature median
+    """
+    X = data[feature_columns].copy()
 
-    for column in data.columns:
+    for col in feature_columns:
+        X[col] = pd.to_numeric(X[col], errors="coerce")
 
-        if column in excluded_columns:
-            continue
+    X = X.replace([np.inf, -np.inf], np.nan)
 
-        if pd.api.types.is_numeric_dtype(
-            data[column]
-        ):
+    # Filter out columns with excessive missing values
+    valid_cols = []
+    for col in feature_columns:
+        missing_rate = X[col].isna().mean()
+        if missing_rate < missing_threshold:
+            valid_cols.append(col)
+        else:
+            print(f"Trimming feature '{col}' due to high missing rate: {missing_rate:.2%}")
 
-            feature_columns.append(
-                column
-            )
+    X = X[valid_cols]
 
-    if len(feature_columns) == 0:
+    # Median imputation
+    for col in valid_cols:
+        med = X[col].median()
+        if pd.isna(med):
+            med = 0.0
+        X[col] = X[col].fillna(med)
 
-        raise ValueError(
-            "No numerical feature columns "
-            "were found."
-        )
-
-    return feature_columns
+    return X, valid_cols
 
 
 # ============================================================
-# CLEAN FEATURES
+# DATA PREPARATION PIPELINE
 # ============================================================
 
-def clean_features(
-    data,
-    feature_columns
-):
+def prepare_data(test_size=0.20, random_state=42):
     """
-    Clean the numerical software metrics.
-
-    Steps:
-        1. Convert to numeric
-        2. Replace infinite values
-        3. Replace missing values with median
+    Complete preprocessing pipeline:
+    1. Load data
+    2. Extract & binarize labels
+    3. Clean and impute missing metric values
+    4. Stratified Train-Test split
+    5. StandardScaler Normalization (Section 4.2.2)
+    6. Persist artifacts
     """
-
-    X = data[
-        feature_columns
-    ].copy()
-
-    # --------------------------------------------------------
-    # Convert to numeric
-    # --------------------------------------------------------
-
-    for column in feature_columns:
-
-        X[column] = pd.to_numeric(
-            X[column],
-            errors="coerce"
-        )
-
-    # --------------------------------------------------------
-    # Replace infinite values
-    # --------------------------------------------------------
-
-    X = X.replace(
-        [np.inf, -np.inf],
-        np.nan
-    )
-
-    # --------------------------------------------------------
-    # Fill missing values
-    # --------------------------------------------------------
-
-    for column in feature_columns:
-
-        median_value = X[
-            column
-        ].median()
-
-        if pd.isna(
-            median_value
-        ):
-
-            median_value = 0.0
-
-        X[column] = X[
-            column
-        ].fillna(
-            median_value
-        )
-
-    return X
-
-
-# ============================================================
-# PREPARE DATA
-# ============================================================
-
-def prepare_data(
-    test_size=0.20,
-    random_state=42
-):
-    """
-    Complete preprocessing pipeline for CM1.
-
-    Returns:
-
-        X_train
-        X_test
-        y_train
-        y_test
-        feature_columns
-        scaler
-    """
-
-    # --------------------------------------------------------
-    # 1. Load CM1
-    # --------------------------------------------------------
-
     data = load_dataset()
+    y = process_target(data)
+    feature_cols = get_feature_columns(data)
+    X, cleaned_feature_cols = clean_features(data, feature_cols)
 
-    # --------------------------------------------------------
-    # 2. Process target
-    # --------------------------------------------------------
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(MODEL_DIR, exist_ok=True)
 
-    y = process_target(
-        data
+    # Save cleaned inspection copy
+    cleaned_df = X.copy()
+    cleaned_df["defects"] = y.values
+    cleaned_df.to_csv(CLEANED_DATA_PATH, index=False)
+
+    # Stratified Train/Test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=y
     )
 
-    # --------------------------------------------------------
-    # 3. Identify features
-    # --------------------------------------------------------
-
-    feature_columns = (
-        get_feature_columns(
-            data
-        )
-    )
-
-    print(
-        "\nFeatures used:"
-    )
-
-    for feature in feature_columns:
-
-        print(
-            "  -",
-            feature
-        )
-
-    # --------------------------------------------------------
-    # 4. Clean features
-    # --------------------------------------------------------
-
-    X = clean_features(
-        data,
-        feature_columns
-    )
-
-    # --------------------------------------------------------
-    # Save cleaned dataset for inspection
-    #
-    # IMPORTANT:
-    # This creates a NEW file.
-    # cm1.csv remains untouched.
-    # --------------------------------------------------------
-
-    cleaned_data = X.copy()
-
-    cleaned_data["defects"] = y.values
-
-    cleaned_data.to_csv(
-        CLEANED_DATA_PATH,
-        index=False
-    )
-
-    print(
-        "\nSaved cleaned dataset:",
-        CLEANED_DATA_PATH
-    )
-
-    # --------------------------------------------------------
-    # 5. Train/test split
-    # --------------------------------------------------------
-
-    X_train, X_test, y_train, y_test = (
-        train_test_split(
-            X,
-            y,
-            test_size=test_size,
-            random_state=random_state,
-            stratify=y
-        )
-    )
-
-    print(
-        "\nTrain samples:",
-        len(X_train)
-    )
-
-    print(
-        "Test samples:",
-        len(X_test)
-    )
-
-    # --------------------------------------------------------
-    # 6. Standardization
-    # --------------------------------------------------------
-
+    # Feature Normalization and Scaling (Section 4.2.2)
     scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
 
-    X_train = scaler.fit_transform(
-        X_train
-    )
+    # Save scaled datasets
+    pd.DataFrame(X_train_scaled, columns=cleaned_feature_cols).assign(defects=y_train.values).to_csv(TRAIN_SCALED_PATH, index=False)
+    pd.DataFrame(X_test_scaled, columns=cleaned_feature_cols).assign(defects=y_test.values).to_csv(TEST_SCALED_PATH, index=False)
 
-    X_test = scaler.transform(
-        X_test
-    )
+    # Save scaler and feature list
+    joblib.dump(scaler, SCALER_PATH)
+    joblib.dump(cleaned_feature_cols, FEATURES_PATH)
 
-    # --------------------------------------------------------
-    # Save scaled datasets for inspection
-    #
-    # These are NEW files.
-    # --------------------------------------------------------
-
-    train_scaled_df = pd.DataFrame(
-        X_train,
-        columns=feature_columns
-    )
-
-    train_scaled_df["defects"] = (
-        y_train.values
-    )
-
-    train_scaled_df.to_csv(
-        TRAIN_SCALED_PATH,
-        index=False
-    )
-
-    test_scaled_df = pd.DataFrame(
-        X_test,
-        columns=feature_columns
-    )
-
-    test_scaled_df["defects"] = (
-        y_test.values
-    )
-
-    test_scaled_df.to_csv(
-        TEST_SCALED_PATH,
-        index=False
-    )
-
-    print(
-        "\nSaved scaled datasets:"
-    )
-
-    print(
-        "  -",
-        TRAIN_SCALED_PATH
-    )
-
-    print(
-        "  -",
-        TEST_SCALED_PATH
-    )
-
-    # --------------------------------------------------------
-    # 7. Create model directory
-    # --------------------------------------------------------
-
-    os.makedirs(
-        MODEL_DIR,
-        exist_ok=True
-    )
-
-    # --------------------------------------------------------
-    # 8. Save scaler
-    # --------------------------------------------------------
-
-    joblib.dump(
-        scaler,
-        SCALER_PATH
-    )
-
-    # --------------------------------------------------------
-    # 9. Save feature order
-    # --------------------------------------------------------
-
-    joblib.dump(
-        feature_columns,
-        FEATURES_PATH
-    )
-
-    print(
-        "\nSaved:"
-    )
-
-    print(
-        "Scaler:",
-        SCALER_PATH
-    )
-
-    print(
-        "Features:",
-        FEATURES_PATH
-    )
-
-    # --------------------------------------------------------
-    # 10. Convert labels to NumPy
-    # --------------------------------------------------------
-
-    y_train = y_train.to_numpy()
-
-    y_test = y_test.to_numpy()
+    print(f"\nPrepared dataset: {len(X_train)} training samples, {len(X_test)} testing samples, {len(cleaned_feature_cols)} features.")
 
     return (
-        X_train,
-        X_test,
-        y_train,
-        y_test,
-        feature_columns,
+        X_train_scaled,
+        X_test_scaled,
+        y_train.to_numpy(),
+        y_test.to_numpy(),
+        cleaned_feature_cols,
         scaler
     )
 
 
-# ============================================================
-# PREPROCESS NEW INPUT
-# ============================================================
-
-def preprocess_new_input(
-    input_data
-):
+def preprocess_new_input(input_data):
     """
-    Preprocess one new software-metric observation.
-
-    input_data can be:
-
-        dictionary
-
-    or:
-
-        pandas DataFrame
+    Preprocesses new software metric observation for prediction.
     """
+    if not os.path.exists(SCALER_PATH) or not os.path.exists(FEATURES_PATH):
+        raise FileNotFoundError("Preprocessing artifacts (scaler.pkl / features.pkl) not found. Run train.py first.")
 
-    if not os.path.exists(
-        SCALER_PATH
-    ):
+    scaler = joblib.load(SCALER_PATH)
+    feature_columns = joblib.load(FEATURES_PATH)
 
-        raise FileNotFoundError(
-            "Scaler not found. "
-            "Please train the model first."
-        )
+    if isinstance(input_data, dict):
+        df = pd.DataFrame([input_data])
+    elif isinstance(input_data, pd.DataFrame):
+        df = input_data.copy()
+    else:
+        raise TypeError("input_data must be a dict or pandas DataFrame.")
 
-    if not os.path.exists(
-        FEATURES_PATH
-    ):
+    # Fill missing features with 0.0
+    for col in feature_columns:
+        if col not in df.columns:
+            df[col] = 0.0
 
-        raise FileNotFoundError(
-            "Feature list not found. "
-            "Please train the model first."
-        )
+    X = df[feature_columns].copy()
+    for col in feature_columns:
+        X[col] = pd.to_numeric(X[col], errors="coerce")
+    X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    # --------------------------------------------------------
-    # Load preprocessing objects
-    # --------------------------------------------------------
-
-    scaler = joblib.load(
-        SCALER_PATH
-    )
-
-    feature_columns = joblib.load(
-        FEATURES_PATH
-    )
-
-    # --------------------------------------------------------
-    # Convert dictionary to DataFrame
-    # --------------------------------------------------------
-
-    if isinstance(
-        input_data,
-        dict
-    ):
-
-        input_data = pd.DataFrame(
-            [input_data]
-        )
-
-    elif not isinstance(
-        input_data,
-        pd.DataFrame
-    ):
-
-        raise TypeError(
-            "input_data must be a dictionary "
-            "or pandas DataFrame."
-        )
-
-    # --------------------------------------------------------
-    # Check missing features
-    # --------------------------------------------------------
-
-    missing_features = [
-        feature
-        for feature in feature_columns
-        if feature not in input_data.columns
-    ]
-
-    if missing_features:
-
-        raise ValueError(
-            "Missing features: "
-            + ", ".join(
-                missing_features
-            )
-        )
-
-    # --------------------------------------------------------
-    # Keep EXACT feature order
-    # --------------------------------------------------------
-
-    X = input_data[
-        feature_columns
-    ].copy()
-
-    # --------------------------------------------------------
-    # Convert to numeric
-    # --------------------------------------------------------
-
-    for column in feature_columns:
-
-        X[column] = pd.to_numeric(
-            X[column],
-            errors="coerce"
-        )
-
-    # --------------------------------------------------------
-    # Replace invalid values
-    # --------------------------------------------------------
-
-    X = X.replace(
-        [np.inf, -np.inf],
-        np.nan
-    )
-
-    X = X.fillna(
-        0
-    )
-
-    # --------------------------------------------------------
-    # Apply training scaler
-    # --------------------------------------------------------
-
-    X = scaler.transform(
-        X
-    )
-
-    return X
+    scaled_X = scaler.transform(X)
+    return scaled_X
 
 
-# ============================================================
-# DATASET INFORMATION
-# ============================================================
+def preprocess_code_snippet(code_str):
+    """
+    Converts raw source code snippet into dense Code2Vec vector representation (Section 4.3).
+    Returns vector (128-dim) and extracted AST path contexts.
+    """
+    vec, contexts = extractor.extract_code_vector(code_str)
+    return vec, contexts
 
-def print_dataset_information():
-
-    data = load_dataset()
-
-    print(
-        "\n" + "=" * 60
-    )
-
-    print(
-        "CM1 DATASET INFORMATION"
-    )
-
-    print(
-        "=" * 60
-    )
-
-    print(
-        "\nTotal rows:",
-        len(data)
-    )
-
-    print(
-        "\nColumns:"
-    )
-
-    for column in data.columns:
-
-        print(
-            "  -",
-            column
-        )
-
-    # --------------------------------------------------------
-    # Target distribution
-    # --------------------------------------------------------
-
-    if "defects" in data.columns:
-
-        target = process_target(
-            data
-        )
-
-        print(
-            "\nDefect distribution:"
-        )
-
-        print(
-            "Non-defective (0):",
-            int(
-                (target == 0).sum()
-            )
-        )
-
-        print(
-            "Defective (1):",
-            int(
-                (target == 1).sum()
-            )
-        )
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 if __name__ == "__main__":
-
-    print_dataset_information()
-
-    print(
-        "\nPreparing CM1 training data..."
-    )
-
-    (
-        X_train,
-        X_test,
-        y_train,
-        y_test,
-        feature_columns,
-        scaler
-    ) = prepare_data()
-
-    print(
-        "\n" + "=" * 60
-    )
-
-    print(
-        "PREPROCESSING COMPLETE"
-    )
-
-    print(
-        "=" * 60
-    )
-
-    print(
-        "\nX_train shape:",
-        X_train.shape
-    )
-
-    print(
-        "X_test shape:",
-        X_test.shape
-    )
-
-    print(
-        "y_train shape:",
-        y_train.shape
-    )
-
-    print(
-        "y_test shape:",
-        y_test.shape
-    )
-
-    print(
-        "\nNumber of features:",
-        len(feature_columns)
-    )
-
-    print(
-        "\nFeature order:"
-    )
-
-    print(
-        feature_columns
-    )
+    X_train, X_test, y_train, y_test, features, scaler = prepare_data()
+    print("Preprocessing completed successfully!")
